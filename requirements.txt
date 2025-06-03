@@ -2,3 +2,11 @@ fastapi
 uvicorn
 PyMuPDF
 python-multipart
+Pillow
+numpy
+python-json-logger
+opencv-python
+scikit-image
+pytest
+pytest-asyncio
+httpx

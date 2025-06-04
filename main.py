@@ -12,82 +12,41 @@ import numpy as np
 app = FastAPI()
 
 def extract_table_data(page):
-    """
-    Extract table data from PDF page, specifically targeting the Particulars column.
-    """
-    # Get text with detailed positioning
-    text_dict = page.get_text("dict")
+
+    words = page.get_text("words")  
+    words.sort(key=lambda w: (w[1], w[0]))  
     
-    # Collect all text blocks with positions
-    text_blocks = []
-    for block in text_dict["blocks"]:
-        if "lines" in block:
-            for line in block["lines"]:
-                for span in line["spans"]:
-                    if span["text"].strip():
-                        text_blocks.append({
-                            "text": span["text"].strip(),
-                            "bbox": span["bbox"],
-                            "x": span["bbox"][0],
-                            "y": span["bbox"][1],
-                            "font_size": span["size"]
-                        })
-    
-    # Sort by Y position (top to bottom), then X position (left to right)
-    text_blocks.sort(key=lambda x: (x["y"], x["x"]))
-    
-    # Find table header and structure
-    header_row = []
-    particulars_column_x = None
-    
-    # Look for table headers
-    for block in text_blocks:
-        text = block["text"].upper()
-        if "PARTICULARS" in text:
-            particulars_column_x = block["x"]
-            break
-        elif "S#" in text or "QTY" in text or "UNIT" in text:
-            header_row.append(block)
-    
-    # If we found header, determine column boundaries
-    if particulars_column_x is None and header_row:
-        # Try to estimate particulars column position
-        header_row.sort(key=lambda x: x["x"])
-        if len(header_row) >= 2:
-            particulars_column_x = header_row[1]["x"]  # Usually second column
-    
-    # Extract table rows
-    table_data = []
-    current_y = None
+    rows = []
+    current_row_y = None
     current_row = []
-    
-    for block in text_blocks:
-        # Skip header area
-        if block["y"] < 200:  # Adjust based on your PDF structure
-            continue
-            
-        # Group blocks by approximate Y position (same row)
-        if current_y is None or abs(block["y"] - current_y) < 10:
-            current_row.append(block)
-            current_y = block["y"]
+
+    for word in words:
+        x0, y0, x1, y1, text = word[:5]
+        if current_row_y is None or abs(y0 - current_row_y) <= 2:
+            current_row.append(word)
+            current_row_y = y0
         else:
-            # Process completed row
-            if current_row:
-                table_data.append(process_table_row(current_row, particulars_column_x))
-            current_row = [block]
-            current_y = block["y"]
-    
-    # Process last row
+            rows.append(current_row)
+            current_row = [word]
+            current_row_y = y0
     if current_row:
-        table_data.append(process_table_row(current_row, particulars_column_x))
-    
-    # Filter and clean data
-    particulars_data = []
-    for row in table_data:
-        if row and row.get("particulars") and len(row["particulars"]) > 10:  # Filter meaningful entries
-            particulars_data.append(row)
-    
-    return particulars_data
+        rows.append(current_row)
+
+    extracted_rows = []
+    for row in rows:
+        texts = [w[4] for w in row]
+        bbox = [min(w[0] for w in row), min(w[1] for w in row),
+                max(w[2] for w in row), max(w[3] for w in row)]
+        
+        extracted_rows.append({
+            "text": " ".join(texts),
+            "bbox": bbox,
+            "words": row,
+            "full_row_bbox": bbox  # Optional - same as bbox here, but can be adjusted
+        })
+
+    return extracted_rows
+
 
 def process_table_row(row_blocks, particulars_column_x):
     """
@@ -170,17 +129,22 @@ def enhance_image_quality(pil_image):
     
     return pil_image
 
-def create_high_quality_snippet(page, bbox, padding=20, zoom_factor=4.0, quality_enhance=True):
+def create_quality_snippet(page, bbox, padding=20, quality_level="high"):
     """
-    Create a high-quality snippet image from the specified bounding box.
+    Create snippet image with different quality levels.
     
     Args:
-        page: PyMuPDF page object
-        bbox: Bounding box coordinates [x0, y0, x1, y1]
-        padding: Padding around the bounding box
-        zoom_factor: Zoom level for rendering (higher = better quality)
-        quality_enhance: Whether to apply image enhancement filters
+        quality_level: "standard", "high", or "ultra"
     """
+    # Quality settings
+    quality_settings = {
+        "standard": {"zoom": 2.0, "enhance": False, "max_width": 800, "max_height": 600},
+        "high": {"zoom": 4.0, "enhance": True, "max_width": 1200, "max_height": 800},
+        "ultra": {"zoom": 6.0, "enhance": True, "max_width": 1600, "max_height": 1200}
+    }
+    
+    settings = quality_settings.get(quality_level, quality_settings["high"])
+    
     # Add padding to the bounding box
     page_rect = page.rect
     padded_rect = fitz.Rect(
@@ -190,10 +154,8 @@ def create_high_quality_snippet(page, bbox, padding=20, zoom_factor=4.0, quality
         min(bbox[3] + padding, page_rect.height)
     )
     
-    # Create transformation matrix with high zoom for better quality
-    matrix = fitz.Matrix(zoom_factor, zoom_factor)
+    matrix = fitz.Matrix(settings["zoom"], settings["zoom"])
     
-    # Render the region to a pixmap with high quality settings
     pix = page.get_pixmap(
         clip=padded_rect, 
         matrix=matrix,
@@ -206,13 +168,12 @@ def create_high_quality_snippet(page, bbox, padding=20, zoom_factor=4.0, quality
     pil_image = Image.open(io.BytesIO(img_bytes))
     
     # Apply quality enhancements
-    if quality_enhance:
+    if settings["enhance"]:
         pil_image = enhance_image_quality(pil_image)
     
-    # Optional: Resize to reasonable dimensions while maintaining quality
-    # This prevents extremely large images while keeping quality high
-    max_width = 1200
-    max_height = 800
+    # Resize to reasonable dimensions while maintaining quality
+    max_width = settings["max_width"]
+    max_height = settings["max_height"]
     
     if pil_image.width > max_width or pil_image.height > max_height:
         # Calculate resize ratio maintaining aspect ratio
@@ -242,147 +203,164 @@ def create_high_quality_snippet(page, bbox, padding=20, zoom_factor=4.0, quality
         "image_data": img_base64,
         "image_url": f"data:image/png;base64,{img_base64}",
         "dimensions": {"width": pil_image.width, "height": pil_image.height},
-        "file_size_kb": len(img_bytes) / 1024
+        "file_size_kb": len(img_bytes) / 1024,
+        "quality_level": quality_level
     }
 
-def create_snippet_image(page, bbox, padding=20):
+def search_multiline_text(page, query, max_line_gap=50):
     """
-    Create a high-quality snippet image (wrapper for backward compatibility).
+    Search for text that might span multiple lines in a PDF page with exact word order matching.
     """
-    return create_high_quality_snippet(page, bbox, padding, zoom_factor=4.0, quality_enhance=True)
-
-def create_ultra_high_quality_snippet(page, bbox, padding=20):
-    """
-    Create ultra high-quality snippet for premium use cases.
-    """
-    return create_high_quality_snippet(page, bbox, padding, zoom_factor=6.0, quality_enhance=True)
-
-@app.post("/extract-particulars")
-async def extract_particulars(file: UploadFile, high_quality: bool = True):
-    """
-    Extract particulars data from PDF with high-quality snippet images for Google Sheets.
-    """
-    try:
-        pdf_bytes = await file.read()
-        stream = io.BytesIO(pdf_bytes)
-        doc = fitz.open(stream=stream, filetype="pdf")
-        
-        all_particulars = []
-        
-        for page_num, page in enumerate(doc):
-            # Extract table data
-            table_data = extract_table_data(page)
-            
-            for row in table_data:
-                if row:
-                    # Create high-quality snippet image for this row
-                    if high_quality:
-                        snippet = create_high_quality_snippet(page, row["full_row_bbox"])
-                    else:
-                        snippet = create_snippet_image(page, row["full_row_bbox"])
-                    
-                    particulars_entry = {
-                        "page": page_num + 1,
-                        "s_number": row["s_number"],
-                        "particulars": row["particulars"],
-                        "qty": row["qty"],
-                        "snippet_image": snippet["image_url"],
-                        "snippet_base64": snippet["image_data"],
-                        "image_dimensions": snippet["dimensions"],
-                        "file_size_kb": snippet.get("file_size_kb", 0),
-                        "coordinates": {
-                            "x0": row["bbox"][0] if row["bbox"] else 0,
-                            "y0": row["bbox"][1] if row["bbox"] else 0,
-                            "x1": row["bbox"][2] if row["bbox"] else 0,
-                            "y1": row["bbox"][3] if row["bbox"] else 0
-                        }
-                    }
-                    
-                    all_particulars.append(particulars_entry)
-        
-        doc.close()
-        
-        return {
-            "success": True,
-            "total_items": len(all_particulars),
-            "data": all_particulars,
-            "google_sheets_ready": True,
-            "quality_settings": {
-                "high_quality": high_quality,
-                "zoom_factor": 4.0 if high_quality else 2.0,
-                "enhancements_applied": high_quality
-            }
-        }
-        
-    except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={"success": False, "error": str(e)}
-        )
-
-@app.post("/extract-particulars-for-sheets")
-async def extract_particulars_for_sheets(file: UploadFile, quality_level: str = "high"):
-    """
-    Extract particulars data formatted specifically for Google Sheets integration.
+    # Get all text blocks from the page with their positions
+    text_dict = page.get_text("dict")
     
-    Args:
-        quality_level: "standard", "high", or "ultra" for different quality levels
+    # Extract text with coordinates, preserving original text structure
+    text_segments = []
+    for block in text_dict["blocks"]:
+        if "lines" in block:
+            for line in block["lines"]:
+                line_text = ""
+                line_bbox = None
+                
+                for span in line["spans"]:
+                    span_text = span["text"]
+                    line_text += span_text
+                    
+                    # Calculate bounding box for the entire line
+                    if line_bbox is None:
+                        line_bbox = list(span["bbox"])
+                    else:
+                        line_bbox[0] = min(line_bbox[0], span["bbox"][0])  # x0
+                        line_bbox[1] = min(line_bbox[1], span["bbox"][1])  # y0
+                        line_bbox[2] = max(line_bbox[2], span["bbox"][2])  # x1
+                        line_bbox[3] = max(line_bbox[3], span["bbox"][3])  # y1
+                
+                if line_text.strip():
+                    text_segments.append({
+                        "text": line_text.strip(),
+                        "bbox": line_bbox,
+                        "y_center": (line_bbox[1] + line_bbox[3]) / 2
+                    })
+    
+    # Sort segments by vertical position (top to bottom)
+    text_segments.sort(key=lambda x: x["y_center"])
+    
+    # Normalize query: clean whitespace but preserve word order
+    query_words = [word.upper() for word in query.split() if word.strip()]
+    if not query_words:
+        return []
+    
+    matches = []
+    
+    # Search for the query in combinations of consecutive lines
+    for i in range(len(text_segments)):
+        combined_text = ""
+        combined_rects = []
+        
+        # Try combining up to 6 consecutive lines
+        for j in range(i, min(i + 6, len(text_segments))):
+            current_segment = text_segments[j]
+            
+            # Check if this line is close enough to the previous one
+            if j > i:
+                prev_segment = text_segments[j-1]
+                vertical_gap = current_segment["y_center"] - prev_segment["y_center"]
+                if vertical_gap > max_line_gap:
+                    break
+            
+            # Add current line text
+            if combined_text:
+                combined_text += " "
+            combined_text += current_segment["text"]
+            combined_rects.append(current_segment["bbox"])
+            
+            # Normalize combined text: split into words and clean
+            combined_words = [word.upper() for word in combined_text.split() if word.strip()]
+            
+            # Check for exact word sequence match
+            if len(combined_words) >= len(query_words):
+                # Look for the exact sequence of query words in the combined text
+                for start_idx in range(len(combined_words) - len(query_words) + 1):
+                    match_found = True
+                    for k, query_word in enumerate(query_words):
+                        if combined_words[start_idx + k] != query_word:
+                            match_found = False
+                            break
+                    
+                    if match_found:
+                        # Calculate bounding rectangle that encompasses all matched lines
+                        if combined_rects:
+                            min_x0 = min(rect[0] for rect in combined_rects)
+                            min_y0 = min(rect[1] for rect in combined_rects)
+                            max_x1 = max(rect[2] for rect in combined_rects)
+                            max_y1 = max(rect[3] for rect in combined_rects)
+                            
+                            # Check if this match overlaps with existing matches
+                            is_duplicate = False
+                            for existing_match in matches:
+                                if (abs(existing_match[0] - min_x0) < 5 and 
+                                    abs(existing_match[1] - min_y0) < 5):
+                                    is_duplicate = True
+                                    break
+                            
+                            if not is_duplicate:
+                                matches.append([min_x0, min_y0, max_x1, max_y1])
+                        break  # Found exact match, no need to continue checking this combination
+    
+    return matches
+
+# CORE ENDPOINTS (PRESERVED)
+
+@app.post("/extract-coordinates-only")
+async def extract_coordinates_only(file: UploadFile):
+    """
+    Dynamic invoice processor to extract row-wise coordinates from any invoice PDF.
     """
     try:
         pdf_bytes = await file.read()
         stream = io.BytesIO(pdf_bytes)
         doc = fitz.open(stream=stream, filetype="pdf")
         
-        sheets_data = []
-        
+        all_coordinates = []
+
         for page_num, page in enumerate(doc):
             table_data = extract_table_data(page)
             
             for row in table_data:
-                if row:
-                    # Create snippet image based on quality level
-                    if quality_level == "ultra":
-                        snippet = create_ultra_high_quality_snippet(page, row["full_row_bbox"])
-                    elif quality_level == "high":
-                        snippet = create_high_quality_snippet(page, row["full_row_bbox"])
-                    else:
-                        snippet = create_snippet_image(page, row["full_row_bbox"])
-                    
-                    # Format for Google Sheets
-                    sheets_row = {
-                        "S_Number": row["s_number"],
-                        "Particulars": row["particulars"],
-                        "Quantity": row["qty"],
-                        "Page": page_num + 1,
-                        "Image_Note": f"=IMAGE(\"{snippet['image_url']}\")",  # Google Sheets IMAGE formula
-                        "Snippet_URL": snippet["image_url"],
-                        "Hover_Text": f"Product: {row['particulars']} | Qty: {row['qty']} | Page: {page_num + 1}",
-                        "Image_Quality": quality_level,
-                        "Image_Size_KB": snippet.get("file_size_kb", 0),
-                        "Image_Dimensions": f"{snippet['dimensions']['width']}x{snippet['dimensions']['height']}"
+                coordinate_entry = {
+                    "page": page_num + 1,
+                    "text": row["text"],
+                    "text_coordinates": {
+                        "x0": row["bbox"][0],
+                        "y0": row["bbox"][1],
+                        "x1": row["bbox"][2],
+                        "y1": row["bbox"][3]
+                    },
+                    "row_coordinates": {
+                        "x0": row["full_row_bbox"][0],
+                        "y0": row["full_row_bbox"][1],
+                        "x1": row["full_row_bbox"][2],
+                        "y1": row["full_row_bbox"][3]
                     }
-                    
-                    sheets_data.append(sheets_row)
+                }
+                all_coordinates.append(coordinate_entry)
         
         doc.close()
-        
+
         return {
             "success": True,
-            "sheets_data": sheets_data,
-            "total_rows": len(sheets_data),
-            "columns": ["S_Number", "Particulars", "Quantity", "Page", "Image_Note", "Snippet_URL", "Hover_Text", "Image_Quality", "Image_Size_KB", "Image_Dimensions"],
-            "quality_settings": {
-                "level": quality_level,
-                "total_size_mb": sum(row.get("Image_Size_KB", 0) for row in sheets_data) / 1024
-            }
+            "total_items": len(all_coordinates),
+            "coordinates": all_coordinates,
+            "note": "Use these coordinates with /get-snippet-image to generate images"
         }
-        
+
     except Exception as e:
         return JSONResponse(
             status_code=500,
             content={"success": False, "error": str(e)}
         )
 
+    
 @app.post("/get-snippet-image")
 async def get_snippet_image(
     file: UploadFile,
@@ -415,12 +393,7 @@ async def get_snippet_image(
         bbox = [x0, y0, x1, y1]
         
         # Create snippet based on quality level
-        if quality_level == "ultra":
-            snippet = create_ultra_high_quality_snippet(selected_page, bbox, padding)
-        elif quality_level == "high":
-            snippet = create_high_quality_snippet(selected_page, bbox, padding)
-        else:
-            snippet = create_snippet_image(selected_page, bbox, padding)
+        snippet = create_quality_snippet(selected_page, bbox, padding, quality_level)
         
         # Return as streaming image
         img_bytes = base64.b64decode(snippet["image_data"])
@@ -441,6 +414,269 @@ async def get_snippet_image(
             content={"error": str(e)}
         )
 
+# UTILITY ENDPOINTS
+
+@app.post("/search-text")
+async def search_text(
+    file: UploadFile,
+    query: str = Form(...),
+    search_type: str = Form("expanded"),  # "normal", "expanded"
+    padding: float = Form(30.0)
+):
+    """
+    Universal text search endpoint combining normal and expanded search functionality.
+    
+    Args:
+        search_type: "normal" returns all matches, "expanded" returns best match with padding
+    """
+    try:
+        pdf_bytes = await file.read()
+        stream = io.BytesIO(pdf_bytes)
+        doc = fitz.open(stream=stream, filetype="pdf")
+        
+        if search_type == "normal":
+            # Return all matches
+            matches = []
+            for i, page in enumerate(doc):
+                # Regular search
+                rects = page.search_for(query)
+                for r in rects:
+                    matches.append({
+                        "page": i + 1,
+                        "x0": r.x0,
+                        "y0": r.y0,
+                        "x1": r.x1,
+                        "y1": r.y1,
+                        "type": "single_line"
+                    })
+                
+                # Multi-line search
+                multiline_rects = search_multiline_text(page, query)
+                for r in multiline_rects:
+                    matches.append({
+                        "page": i + 1,
+                        "x0": r[0],
+                        "y0": r[1],
+                        "x1": r[2],
+                        "y1": r[3],
+                        "type": "multi_line"
+                    })
+            
+            return {"success": True, "matches": matches}
+        
+        else:  # expanded search
+            # Return best match with padding
+            best_match = None
+            best_match_type = None
+            best_match_rect = None
+            best_match_score = 0
+            best_match_page = None
+
+            query_words = [word.upper() for word in query.split() if word.strip()]
+            if not query_words:
+                return {"error": "Empty or invalid query"}
+
+            for i, page in enumerate(doc):
+                width, height = page.rect.width, page.rect.height
+
+                # Single-line match check
+                rects = page.search_for(query)
+                for r in rects:
+                    match_score = len(query)
+                    if match_score > best_match_score:
+                        best_match_score = match_score
+                        best_match_type = "single_line"
+                        best_match_rect = [
+                            max(r.x0 - padding, 0),
+                            max(r.y0 - padding, 0),
+                            min(r.x1 + padding, width),
+                            min(r.y1 + padding, height)
+                        ]
+                        best_match_page = i + 1
+
+                # Multi-line match check
+                multiline_rects = search_multiline_text(page, query)
+                for r in multiline_rects:
+                    rect_text = page.get_textbox(fitz.Rect(*r))
+                    match_words = [word.upper() for word in rect_text.split() if word.strip()]
+                    for start_idx in range(len(match_words) - len(query_words) + 1):
+                        if match_words[start_idx:start_idx + len(query_words)] == query_words:
+                            match_score = len(query_words)
+                            if match_score > best_match_score:
+                                best_match_score = match_score
+                                best_match_type = "multi_line"
+                                best_match_rect = [
+                                    max(r[0] - padding, 0),
+                                    max(r[1] - padding, 0),
+                                    min(r[2] + padding, width),
+                                    min(r[3] + padding, height)
+                                ]
+                                best_match_page = i + 1
+                            break
+
+            if best_match_rect:
+                return {
+                    "success": True,
+                    "page": best_match_page,
+                    "x0": best_match_rect[0],
+                    "y0": best_match_rect[1],
+                    "x1": best_match_rect[2],
+                    "y1": best_match_rect[3],
+                    "type": best_match_type
+                }
+            else:
+                return {"success": False, "message": "No match found"}
+        
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "error": str(e)}
+        )
+
+@app.post("/get-pdf-info")
+async def get_pdf_info(
+    file: UploadFile,
+    include_pages: bool = Form(False),
+    page_number: int = Form(None)
+):
+    """
+    Get PDF information including pages, dimensions, and text structure.
+    
+    Args:
+        include_pages: Whether to include page images
+        page_number: Specific page to analyze (if not provided, analyzes all pages)
+    """
+    try:
+        pdf_bytes = await file.read()
+        stream = io.BytesIO(pdf_bytes)
+        doc = fitz.open(stream=stream, filetype="pdf")
+        
+        pdf_info = {
+            "success": True,
+            "total_pages": len(doc),
+            "pages": []
+        }
+        
+        # Determine which pages to process
+        if page_number:
+            if page_number < 1 or page_number > len(doc):
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": f"Invalid page number. PDF has {len(doc)} pages."}
+                )
+            pages_to_process = [page_number - 1]
+        else:
+            pages_to_process = range(len(doc))
+        
+        for page_idx in pages_to_process:
+            page = doc[page_idx]
+            page_info = {
+                "page_number": page_idx + 1,
+                "width": page.rect.width,
+                "height": page.rect.height
+            }
+            
+            # Include page image if requested
+            if include_pages:
+                matrix = fitz.Matrix(2, 2)  # 2x zoom for clear reference
+                pix = page.get_pixmap(matrix=matrix, alpha=False)
+                img_bytes = pix.tobytes("png")
+                img_base64 = base64.b64encode(img_bytes).decode('utf-8')
+                
+                page_info.update({
+                    "image_url": f"data:image/png;base64,{img_base64}",
+                    "image_dimensions": {
+                        "width": pix.width,
+                        "height": pix.height
+                    }
+                })
+            
+            # Add text structure analysis
+            text_dict = page.get_text("dict")
+            text_blocks = []
+            
+            for block in text_dict["blocks"]:
+                if "lines" in block:
+                    for line in block["lines"]:
+                        for span in line["spans"]:
+                            if span["text"].strip():
+                                text_blocks.append({
+                                    "text": span["text"].strip(),
+                                    "coordinates": {
+                                        "x0": span["bbox"][0],
+                                        "y0": span["bbox"][1],
+                                        "x1": span["bbox"][2],
+                                        "y1": span["bbox"][3]
+                                    },
+                                    "font_size": span["size"],
+                                    "font_name": span["font"]
+                                })
+            
+            # Sort by position
+            text_blocks.sort(key=lambda x: (x["coordinates"]["y0"], x["coordinates"]["x0"]))
+            
+            page_info["text_blocks"] = text_blocks
+            page_info["total_text_blocks"] = len(text_blocks)
+            
+            pdf_info["pages"].append(page_info)
+        
+        doc.close()
+        return pdf_info
+        
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "error": str(e)}
+        )
+
+@app.post("/snip-region")
+async def snip_region(
+    file: UploadFile,
+    page: int = Form(...),
+    x0: float = Form(...),
+    y0: float = Form(...),
+    x1: float = Form(...),
+    y1: float = Form(...),
+    padding: float = Form(0.0)
+):
+    """
+    Simple region snipping endpoint for quick image extraction.
+    """
+    try:
+        pdf_bytes = await file.read()
+        stream = io.BytesIO(pdf_bytes)
+        doc = fitz.open(stream=stream, filetype="pdf")
+
+        # Validate page number
+        if page < 1 or page > len(doc):
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Invalid page number"}
+            )
+
+        selected_page = doc[page - 1]
+        width, height = selected_page.rect.width, selected_page.rect.height
+
+        # Apply padding
+        padded_x0 = max(x0 - padding, 0)
+        padded_y0 = max(y0 - padding, 0)
+        padded_x1 = min(x1 + padding, width)
+        padded_y1 = min(y1 + padding, height)
+
+        rect = fitz.Rect(padded_x0, padded_y0, padded_x1, padded_y1)
+
+        # Render clipped region to pixmap (image)
+        pix = selected_page.get_pixmap(clip=rect, dpi=150)
+        img_bytes = pix.tobytes("png")
+
+        return StreamingResponse(io.BytesIO(img_bytes), media_type="image/png")
+        
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": str(e)}
+        )
+
 @app.get("/quality-settings")
 async def get_quality_settings():
     """
@@ -451,18 +687,21 @@ async def get_quality_settings():
             "standard": {
                 "zoom_factor": 2.0,
                 "enhancements": False,
+                "max_dimensions": "800x600",
                 "description": "Basic quality, smaller file size",
                 "recommended_for": "Quick previews, low bandwidth"
             },
             "high": {
                 "zoom_factor": 4.0,
                 "enhancements": True,
+                "max_dimensions": "1200x800",
                 "description": "High quality with image enhancements",
                 "recommended_for": "Google Sheets, general use"
             },
             "ultra": {
                 "zoom_factor": 6.0,
                 "enhancements": True,
+                "max_dimensions": "1600x1200",
                 "description": "Ultra high quality for premium use cases",
                 "recommended_for": "Print quality, detailed analysis"
             }
@@ -476,226 +715,6 @@ async def get_quality_settings():
         ]
     }
 
-
-# Add these additional endpoints to your existing FastAPI code
-
-@app.post("/get-pdf-pages")
-async def get_pdf_pages(file: UploadFile):
-    """
-    Get all PDF pages as images with dimensions for coordinate reference.
-    Useful for manual coordinate selection in n8n workflows.
-    """
-    try:
-        pdf_bytes = await file.read()
-        stream = io.BytesIO(pdf_bytes)
-        doc = fitz.open(stream=stream, filetype="pdf")
-        
-        pages_info = []
-        
-        for page_num, page in enumerate(doc):
-            # Render page as image for reference
-            matrix = fitz.Matrix(2, 2)  # 2x zoom for clear reference
-            pix = page.get_pixmap(matrix=matrix, alpha=False)
-            img_bytes = pix.tobytes("png")
-            img_base64 = base64.b64encode(img_bytes).decode('utf-8')
-            
-            page_info = {
-                "page_number": page_num + 1,
-                "width": page.rect.width,
-                "height": page.rect.height,
-                "image_url": f"data:image/png;base64,{img_base64}",
-                "image_dimensions": {
-                    "width": pix.width,
-                    "height": pix.height
-                }
-            }
-            pages_info.append(page_info)
-        
-        doc.close()
-        
-        return {
-            "success": True,
-            "total_pages": len(pages_info),
-            "pages": pages_info
-        }
-        
-    except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={"success": False, "error": str(e)}
-        )
-
-@app.post("/find-text-coordinates")
-async def find_text_coordinates(
-    file: UploadFile,
-    search_text: str = Form(...),
-    page_number: int = Form(None),
-    case_sensitive: bool = Form(False)
-):
-    """
-    Find coordinates of specific text in PDF.
-    Useful for locating specific items by text search.
-    """
-    try:
-        pdf_bytes = await file.read()
-        stream = io.BytesIO(pdf_bytes)
-        doc = fitz.open(stream=stream, filetype="pdf")
-        
-        text_locations = []
-        
-        # Search in specific page or all pages
-        pages_to_search = [page_number - 1] if page_number else range(len(doc))
-        
-        for page_idx in pages_to_search:
-            if page_idx < 0 or page_idx >= len(doc):
-                continue
-                
-            page = doc[page_idx]
-            
-            # Search for text
-            if case_sensitive:
-                text_instances = page.search_for(search_text)
-            else:
-                text_instances = page.search_for(search_text, flags=fitz.TEXT_IGNORE_CASE)
-            
-            for rect in text_instances:
-                text_locations.append({
-                    "page": page_idx + 1,
-                    "text": search_text,
-                    "coordinates": {
-                        "x0": rect.x0,
-                        "y0": rect.y0,
-                        "x1": rect.x1,
-                        "y1": rect.y1
-                    },
-                    "bbox": [rect.x0, rect.y0, rect.x1, rect.y1]
-                })
-        
-        doc.close()
-        
-        return {
-            "success": True,
-            "search_text": search_text,
-            "total_found": len(text_locations),
-            "locations": text_locations
-        }
-        
-    except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={"success": False, "error": str(e)}
-        )
-
-@app.post("/get-table-structure")
-async def get_table_structure(file: UploadFile, page_number: int = Form(1)):
-    """
-    Analyze table structure and return all detected cells with coordinates.
-    Useful for understanding the table layout.
-    """
-    try:
-        pdf_bytes = await file.read()
-        stream = io.BytesIO(pdf_bytes)
-        doc = fitz.open(stream=stream, filetype="pdf")
-        
-        if page_number < 1 or page_number > len(doc):
-            return JSONResponse(
-                status_code=400,
-                content={"error": f"Invalid page number. PDF has {len(doc)} pages."}
-            )
-        
-        page = doc[page_number - 1]
-        
-        # Get all text blocks with positions
-        text_dict = page.get_text("dict")
-        all_text_blocks = []
-        
-        for block in text_dict["blocks"]:
-            if "lines" in block:
-                for line in block["lines"]:
-                    for span in line["spans"]:
-                        if span["text"].strip():
-                            all_text_blocks.append({
-                                "text": span["text"].strip(),
-                                "coordinates": {
-                                    "x0": span["bbox"][0],
-                                    "y0": span["bbox"][1],
-                                    "x1": span["bbox"][2],
-                                    "y1": span["bbox"][3]
-                                },
-                                "font_size": span["size"],
-                                "font_name": span["font"]
-                            })
-        
-        # Sort by position
-        all_text_blocks.sort(key=lambda x: (x["coordinates"]["y0"], x["coordinates"]["x0"]))
-        
-        doc.close()
-        
-        return {
-            "success": True,
-            "page": page_number,
-            "total_text_blocks": len(all_text_blocks),
-            "text_blocks": all_text_blocks,
-            "usage_note": "Use these coordinates with /get-snippet-image endpoint"
-        }
-        
-    except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={"success": False, "error": str(e)}
-        )
-
-@app.post("/extract-coordinates-only")
-async def extract_coordinates_only(file: UploadFile):
-    """
-    Extract only the coordinates of detected table rows without creating images.
-    Lightweight endpoint for coordinate detection.
-    """
-    try:
-        pdf_bytes = await file.read()
-        stream = io.BytesIO(pdf_bytes)
-        doc = fitz.open(stream=stream, filetype="pdf")
-        
-        all_coordinates = []
-        
-        for page_num, page in enumerate(doc):
-            # Extract table data (reuse existing function)
-            table_data = extract_table_data(page)
-            
-            for row in table_data:
-                if row:
-                    coordinate_entry = {
-                        "page": page_num + 1,
-                        "s_number": row["s_number"],
-                        "particulars": row["particulars"],
-                        "qty": row["qty"],
-                        "text_coordinates": {
-                            "x0": row["bbox"][0] if row["bbox"] else 0,
-                            "y0": row["bbox"][1] if row["bbox"] else 0,
-                            "x1": row["bbox"][2] if row["bbox"] else 0,
-                            "y1": row["bbox"][3] if row["bbox"] else 0
-                        },
-                        "row_coordinates": {
-                            "x0": row["full_row_bbox"][0],
-                            "y0": row["full_row_bbox"][1],
-                            "x1": row["full_row_bbox"][2],
-                            "y1": row["full_row_bbox"][3]
-                        }
-                    }
-                    
-                    all_coordinates.append(coordinate_entry)
-        
-        doc.close()
-        
-        return {
-            "success": True,
-            "total_items": len(all_coordinates),
-            "coordinates": all_coordinates,
-            "note": "Use these coordinates with /get-snippet-image to generate images"
-        }
-        
-    except Exception as e:
-        return JSONResponse(
-            status_code=500,
-            content={"success": False, "error": str(e)}
-        )
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -210,106 +210,56 @@ def create_quality_snippet(page, bbox, padding=20, quality_level="high"):
 def search_multiline_text(page, query, max_line_gap=50):
     """
     Search for text that might span multiple lines in a PDF page with exact word order matching.
+    This version builds a word-level index to allow flexible line breaks.
     """
-    # Get all text blocks from the page with their positions
+    # Flatten all spans into a list of words with coordinates and y position
     text_dict = page.get_text("dict")
-    
-    # Extract text with coordinates, preserving original text structure
-    text_segments = []
+    word_entries = []
+
     for block in text_dict["blocks"]:
         if "lines" in block:
             for line in block["lines"]:
-                line_text = ""
-                line_bbox = None
-                
                 for span in line["spans"]:
-                    span_text = span["text"]
-                    line_text += span_text
-                    
-                    # Calculate bounding box for the entire line
-                    if line_bbox is None:
-                        line_bbox = list(span["bbox"])
-                    else:
-                        line_bbox[0] = min(line_bbox[0], span["bbox"][0])  # x0
-                        line_bbox[1] = min(line_bbox[1], span["bbox"][1])  # y0
-                        line_bbox[2] = max(line_bbox[2], span["bbox"][2])  # x1
-                        line_bbox[3] = max(line_bbox[3], span["bbox"][3])  # y1
-                
-                if line_text.strip():
-                    text_segments.append({
-                        "text": line_text.strip(),
-                        "bbox": line_bbox,
-                        "y_center": (line_bbox[1] + line_bbox[3]) / 2
-                    })
-    
-    # Sort segments by vertical position (top to bottom)
-    text_segments.sort(key=lambda x: x["y_center"])
-    
-    # Normalize query: clean whitespace but preserve word order
-    query_words = [word.upper() for word in query.split() if word.strip()]
+                    for word in span["text"].split():
+                        word_entries.append({
+                            "text": word,
+                            "bbox": span["bbox"],
+                            "y_center": (span["bbox"][1] + span["bbox"][3]) / 2
+                        })
+
+    if not word_entries:
+        return []
+
+    # Normalize query into words
+    query_words = [w.upper() for w in query.strip().split()]
     if not query_words:
         return []
-    
+
+    # Normalize all page words
+    page_words = [(i, w["text"].upper()) for i, w in enumerate(word_entries)]
+
     matches = []
-    
-    # Search for the query in combinations of consecutive lines
-    for i in range(len(text_segments)):
-        combined_text = ""
-        combined_rects = []
-        
-        # Try combining up to 6 consecutive lines
-        for j in range(i, min(i + 6, len(text_segments))):
-            current_segment = text_segments[j]
-            
-            # Check if this line is close enough to the previous one
-            if j > i:
-                prev_segment = text_segments[j-1]
-                vertical_gap = current_segment["y_center"] - prev_segment["y_center"]
-                if vertical_gap > max_line_gap:
-                    break
-            
-            # Add current line text
-            if combined_text:
-                combined_text += " "
-            combined_text += current_segment["text"]
-            combined_rects.append(current_segment["bbox"])
-            
-            # Normalize combined text: split into words and clean
-            combined_words = [word.upper() for word in combined_text.split() if word.strip()]
-            
-            # Check for exact word sequence match
-            if len(combined_words) >= len(query_words):
-                # Look for the exact sequence of query words in the combined text
-                for start_idx in range(len(combined_words) - len(query_words) + 1):
-                    match_found = True
-                    for k, query_word in enumerate(query_words):
-                        if combined_words[start_idx + k] != query_word:
-                            match_found = False
-                            break
-                    
-                    if match_found:
-                        # Calculate bounding rectangle that encompasses all matched lines
-                        if combined_rects:
-                            min_x0 = min(rect[0] for rect in combined_rects)
-                            min_y0 = min(rect[1] for rect in combined_rects)
-                            max_x1 = max(rect[2] for rect in combined_rects)
-                            max_y1 = max(rect[3] for rect in combined_rects)
-                            
-                            # Check if this match overlaps with existing matches
-                            is_duplicate = False
-                            for existing_match in matches:
-                                if (abs(existing_match[0] - min_x0) < 5 and 
-                                    abs(existing_match[1] - min_y0) < 5):
-                                    is_duplicate = True
-                                    break
-                            
-                            if not is_duplicate:
-                                matches.append([min_x0, min_y0, max_x1, max_y1])
-                        break  # Found exact match, no need to continue checking this combination
-    
+    i = 0
+    while i <= len(page_words) - len(query_words):
+        match = True
+        for j in range(len(query_words)):
+            if page_words[i + j][1] != query_words[j]:
+                match = False
+                break
+        if match:
+            idx_range = range(i, i + len(query_words))
+            matched_boxes = [word_entries[idx]["bbox"] for idx in idx_range]
+            x0 = min(b[0] for b in matched_boxes)
+            y0 = min(b[1] for b in matched_boxes)
+            x1 = max(b[2] for b in matched_boxes)
+            y1 = max(b[3] for b in matched_boxes)
+            matches.append([x0, y0, x1, y1])
+            i += len(query_words)
+        else:
+            i += 1
+
     return matches
 
-# CORE ENDPOINTS (PRESERVED)
 
 @app.post("/extract-coordinates-only")
 async def extract_coordinates_only(file: UploadFile):

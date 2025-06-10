@@ -943,153 +943,215 @@ def enhanced_search_multiline_text(page, query, max_line_gap=100, fuzzy_threshol
 async def search_text(
     file: UploadFile,
     query: str = Form(...),
-    search_type: str = Form("enhanced"),  # "normal", "expanded", "enhanced"
-    fuzzy_threshold: float = Form(0.7),   # Fuzzy matching threshold (0.0 - 1.0)
-    pad_top: float = Form(20.0),
-    pad_bottom: float = Form(20.0),
-    pad_left: float = Form(20.0),
-    pad_right: float = Form(20.0)
+    search_type: str = Form("expanded"),  # "normal", "expanded"
+    padding: float = Form(30.0)
 ):
     """
-    Enhanced search text with fuzzy matching for scanned documents.
-    - 'normal': Standard search (all matches)
-    - 'expanded': Best match only  
-    - 'enhanced': Fuzzy matching with OCR error handling (recommended for scanned docs)
+    Universal text search endpoint combining normal and expanded search functionality.
+    
+    Args:
+        search_type: "normal" returns all matches, "expanded" returns best match with padding
     """
     try:
-        if not query.strip():
-            return JSONResponse(status_code=400, content={"error": "Empty query is not allowed."})
-        
-        if not 0.0 <= fuzzy_threshold <= 1.0:
-            return JSONResponse(status_code=400, content={"error": "Fuzzy threshold must be between 0.0 and 1.0."})
-            
-        if any(p < 0 or p > 200 for p in [pad_top, pad_bottom, pad_left, pad_right]):
-            return JSONResponse(status_code=400, content={"error": "Padding must be between 0 and 200 pixels."})
-
         pdf_bytes = await file.read()
         stream = io.BytesIO(pdf_bytes)
         doc = fitz.open(stream=stream, filetype="pdf")
 
-        matches = []
-
-        for i, page in enumerate(doc):
-            width, height = page.rect.width, page.rect.height
-            page_number = i + 1
-
-            if search_type == "enhanced":
-                # Use enhanced search with fuzzy matching
-                enhanced_matches = enhanced_search_multiline_text(page, query, fuzzy_threshold=fuzzy_threshold)
-                for r in enhanced_matches:
+        if search_type == "normal":
+            # Return all matches
+            matches = []
+            for i, page in enumerate(doc):
+                # Regular search
+                rects = page.search_for(query)
+                for r in rects:
                     matches.append({
-                        "page": page_number,
-                        "x0": max(r[0] - pad_left, 0),
-                        "y0": max(r[1] - pad_top, 0),
-                        "x1": min(r[2] + pad_right, width),
-                        "y1": min(r[3] + pad_bottom, height),
-                        "type": "enhanced_fuzzy",
-                        "confidence": "high" if len(enhanced_matches) == 1 else "medium"
-                    })
-                    
-            elif search_type == "normal":
-                # Original normal search
-                single_matches = page.search_for(query)
-                for r in single_matches:
-                    matches.append({
-                        "page": page_number,
-                        "x0": max(r.x0 - pad_left, 0),
-                        "y0": max(r.y0 - pad_top, 0),
-                        "x1": min(r.x1 + pad_right, width),
-                        "y1": min(r.y1 + pad_bottom, height),
-                        "type": "exact_match"
+                        "page": i + 1,
+                        "x0": r.x0,
+                        "y0": r.y0,
+                        "x1": r.x1,
+                        "y1": r.y1,
+                        "type": "single_line"
                     })
 
-                # Also try enhanced search as fallback
-                if not single_matches:
-                    enhanced_matches = enhanced_search_multiline_text(page, query, fuzzy_threshold=fuzzy_threshold)
-                    for r in enhanced_matches:
-                        matches.append({
-                            "page": page_number,
-                            "x0": max(r[0] - pad_left, 0),
-                            "y0": max(r[1] - pad_top, 0),
-                            "x1": min(r[2] + pad_right, width),
-                            "y1": min(r[3] + pad_bottom, height),
-                            "type": "fuzzy_fallback"
-                        })
+                # Multi-line search
+                multiline_rects = search_multiline_text(page, query)
+                for r in multiline_rects:
+                    matches.append({
+                        "page": i + 1,
+                        "x0": r[0],
+                        "y0": r[1],
+                        "x1": r[2],
+                        "y1": r[3],
+                        "type": "multi_line"
+                    })
 
-            else:  # expanded mode
-                best_match = None
-                best_score = 0
-                best_rect = None
-                best_type = None
+            return {"success": True, "matches": matches}
 
-                # Try exact search first
-                single_matches = page.search_for(query)
-                if single_matches:
-                    r = single_matches[0]  # Take first exact match
-                    best_rect = [
-                        max(r.x0 - pad_left, 0),
-                        max(r.y0 - pad_top, 0),
-                        min(r.x1 + pad_right, width),
-                        min(r.y1 + pad_bottom, height)
-                    ]
-                    best_type = "exact_match"
-                    best_score = 1.0
-                else:
-                    # Use enhanced search
-                    enhanced_matches = enhanced_search_multiline_text(page, query, fuzzy_threshold=fuzzy_threshold)
-                    if enhanced_matches:
-                        r = enhanced_matches[0]  # Take first enhanced match
-                        best_rect = [
-                            max(r[0] - pad_left, 0),
-                            max(r[1] - pad_top, 0),
-                            min(r[2] + pad_right, width),
-                            min(r[3] + pad_bottom, height)
+        else:  # expanded search
+            # Return best match with padding
+            best_match = None
+            best_match_type = None
+            best_match_rect = None
+            best_match_score = 0
+            best_match_page = None
+
+            query_words = [word.upper() for word in query.split() if word.strip()]
+            if not query_words:
+                return {"error": "Empty or invalid query"}
+
+            for i, page in enumerate(doc):
+                width, height = page.rect.width, page.rect.height
+
+                # Single-line match check
+                rects = page.search_for(query)
+                for r in rects:
+                    match_score = len(query)
+                    if match_score > best_match_score:
+                        best_match_score = match_score
+                        best_match_type = "single_line"
+                        best_match_rect = [
+                            max(r.x0 - padding, 0),
+                            max(r.y0 - padding, 0),
+                            min(r.x1 + padding, width),
+                            min(r.y1 + padding, height)
                         ]
-                        best_type = "enhanced_match"
-                        best_score = fuzzy_threshold
+                        best_match_page = i + 1
 
-                if best_rect:
-                    matches.append({
-                        "page": page_number,
-                        "x0": best_rect[0],
-                        "y0": best_rect[1],
-                        "x1": best_rect[2],
-                        "y1": best_rect[3],
-                        "type": best_type,
-                        "confidence_score": best_score
-                    })
+                # Multi-line match check
+                multiline_rects = search_multiline_text(page, query)
+                for r in multiline_rects:
+                    rect_text = page.get_textbox(fitz.Rect(*r))
+                    match_words = [word.upper() for word in rect_text.split() if word.strip()]
+                    for start_idx in range(len(match_words) - len(query_words) + 1):
+                        if match_words[start_idx:start_idx + len(query_words)] == query_words:
+                            match_score = len(query_words)
+                            if match_score > best_match_score:
+                                best_match_score = match_score
+                                best_match_type = "multi_line"
+                                best_match_rect = [
+                                    max(r[0] - padding, 0),
+                                    max(r[1] - padding, 0),
+                                    min(r[2] + padding, width),
+                                    min(r[3] + padding, height)
+                                ]
+                                best_match_page = i + 1
+                            break
 
-        if not matches:
-            return JSONResponse(
-                status_code=404, 
-                content={
-                    "success": False, 
-                    "message": f"No matches found for '{query}'. Try reducing fuzzy_threshold or using 'enhanced' search_type.",
-                    "suggestion": "For scanned documents, try fuzzy_threshold=0.5 or lower"
+            if best_match_rect:
+                return {
+                    "success": True,
+                    "page": best_match_page,
+                    "x0": best_match_rect[0],
+                    "y0": best_match_rect[1],
+                    "x1": best_match_rect[2],
+                    "y1": best_match_rect[3],
+                    "type": best_match_type
                 }
-            )
-
-        return {
-            "success": True,
-            "query": query,
-            "search_type": search_type,
-            "fuzzy_threshold": fuzzy_threshold if search_type == "enhanced" else None,
-            "padding": {
-                "top": pad_top,
-                "bottom": pad_bottom,
-                "left": pad_left,
-                "right": pad_right
-            },
-            "matches": matches,
-            "total_matches": len(matches)
-        }
+            else:
+                return {"success": False, "message": "No match found"}
 
     except Exception as e:
         return JSONResponse(
             status_code=500,
-            content={"success": False, "error": f"Internal error: {str(e)}"})
+            content={"success": False, "error": str(e)}
+        )
 
-# Also add this diagnostic endpoint
+@app.post("/get-pdf-info")
+async def get_pdf_info(
+    file: UploadFile,
+    include_pages: bool = Form(False),
+    page_number: int = Form(None)
+):
+    """
+    Get PDF information including pages, dimensions, and text structure.
+    
+    Args:
+        include_pages: Whether to include page images
+        page_number: Specific page to analyze (if not provided, analyzes all pages)
+    """
+    try:
+        pdf_bytes = await file.read()
+        stream = io.BytesIO(pdf_bytes)
+        doc = fitz.open(stream=stream, filetype="pdf")
+
+        pdf_info = {
+            "success": True,
+            "total_pages": len(doc),
+            "pages": []
+        }
+
+        # Determine which pages to process
+        if page_number:
+            if page_number < 1 or page_number > len(doc):
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": f"Invalid page number. PDF has {len(doc)} pages."}
+                )
+            pages_to_process = [page_number - 1]
+        else:
+            pages_to_process = range(len(doc))
+
+        for page_idx in pages_to_process:
+            page = doc[page_idx]
+            page_info = {
+                "page_number": page_idx + 1,
+                "width": page.rect.width,
+                "height": page.rect.height
+            }
+
+            # Include page image if requested
+            if include_pages:
+                matrix = fitz.Matrix(2, 2)  # 2x zoom for clear reference
+                pix = page.get_pixmap(matrix=matrix, alpha=False)
+                img_bytes = pix.tobytes("png")
+                img_base64 = base64.b64encode(img_bytes).decode('utf-8')
+
+                page_info.update({
+                    "image_url": f"data:image/png;base64,{img_base64}",
+                    "image_dimensions": {
+                        "width": pix.width,
+                        "height": pix.height
+                    }
+                })
+
+            # Add text structure analysis
+            text_dict = page.get_text("dict")
+            text_blocks = []
+
+            for block in text_dict["blocks"]:
+                if "lines" in block:
+                    for line in block["lines"]:
+                        for span in line["spans"]:
+                            if span["text"].strip():
+                                text_blocks.append({
+                                    "text": span["text"].strip(),
+                                    "coordinates": {
+                                        "x0": span["bbox"][0],
+                                        "y0": span["bbox"][1],
+                                        "x1": span["bbox"][2],
+                                        "y1": span["bbox"][3]
+                                    },
+                                    "font_size": span["size"],
+                                    "font_name": span["font"]
+                                })
+
+            # Sort by position
+            text_blocks.sort(key=lambda x: (x["coordinates"]["y0"], x["coordinates"]["x0"]))
+
+            page_info["text_blocks"] = text_blocks
+            page_info["total_text_blocks"] = len(text_blocks)
+
+            pdf_info["pages"].append(page_info)
+
+        doc.close()
+        return pdf_info
+
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "error": str(e)}
+        )
+
 @app.post("/diagnose-text-extraction")
 async def diagnose_text_extraction(
     file: UploadFile,
@@ -1377,7 +1439,7 @@ async def detect_invoice_table(file: UploadFile, page_number: int = Form(1)):
             content={"success": False, "error": str(e)}
         )
     
-    
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

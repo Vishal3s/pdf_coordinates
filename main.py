@@ -1440,6 +1440,138 @@ async def detect_invoice_table(file: UploadFile, page_number: int = Form(1)):
         )
     
 
+@app.post("/get-row-by-query")
+async def get_row_by_query(
+    file: UploadFile,
+    query: str = Form(...),
+    page: Optional[int] = Form(None),
+    padding: int = Form(5)
+):
+    """
+    Find the entire row containing the specified query text.
+    Returns the coordinates of the whole row where the text appears.
+    
+    Args:
+        query: Text to search for in the PDF
+        page: Optional specific page to search (searches all pages if not provided)
+        padding: Additional pixels to add around the row coordinates
+    """
+    try:
+        pdf_bytes = await file.read()
+        stream = io.BytesIO(pdf_bytes)
+        doc = fitz.open(stream=stream, filetype="pdf")
+        
+        results = []
+        
+        # Determine which pages to search
+        if page:
+            if page < 1 or page > len(doc):
+                doc.close()
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": f"Invalid page number. PDF has {len(doc)} pages."}
+                )
+            pages_to_search = [page - 1]
+        else:
+            pages_to_search = range(len(doc))
+        
+        for page_num in pages_to_search:
+            current_page = doc[page_num]
+            
+            # First try exact search
+            found_rects = current_page.search_for(query)
+            
+            # If no exact matches, try fuzzy search
+            if not found_rects:
+                found_rects = enhanced_search_multiline_text(current_page, query)
+                if not found_rects:
+                    continue
+            
+            # For each found rectangle, find the full row
+            for rect in found_rects:
+                if isinstance(rect, fitz.Rect):
+                    bbox = [rect.x0, rect.y0, rect.x1, rect.y1]
+                else:  # from enhanced search
+                    bbox = rect
+                
+                # Get all words on the page
+                words = current_page.get_text("words")
+                
+                # Find words in the same row (similar y-coordinates)
+                row_words = []
+                current_y = None
+                
+                for word in words:
+                    word_bbox = word[:4]
+                    word_y_center = (word_bbox[1] + word_bbox[3]) / 2
+                    
+                    # Check if word is in the same row (within a small y-range)
+                    if current_y is None:
+                        # First word in row - use the found word's y position
+                        current_y = (bbox[1] + bbox[3]) / 2
+                        y_threshold = max(10, (bbox[3] - bbox[1]) * 1.5)
+                    
+                    if abs(word_y_center - current_y) <= y_threshold:
+                        row_words.append(word_bbox)
+                
+                if row_words:
+                    # Calculate full row bounding box
+                    min_x = min(w[0] for w in row_words)
+                    min_y = min(w[1] for w in row_words)
+                    max_x = max(w[2] for w in row_words)
+                    max_y = max(w[3] for w in row_words)
+                    
+                    # Apply padding
+                    page_rect = current_page.rect
+                    padded_bbox = [
+                        max(min_x - padding, 0),
+                        max(min_y - padding, 0),
+                        min(max_x + padding, page_rect.width),
+                        min(max_y + padding, page_rect.height)
+                    ]
+                    
+                    # Get the text of the full row
+                    row_text = current_page.get_textbox(fitz.Rect(*padded_bbox))
+                    
+                    results.append({
+                        "page": page_num + 1,
+                        "query": query,
+                        "found_at": {
+                            "x0": bbox[0],
+                            "y0": bbox[1],
+                            "x1": bbox[2],
+                            "y1": bbox[3]
+                        },
+                        "full_row": {
+                            "x0": padded_bbox[0],
+                            "y0": padded_bbox[1],
+                            "x1": padded_bbox[2],
+                            "y1": padded_bbox[3],
+                            "text": row_text.strip()
+                        }
+                    })
+        
+        doc.close()
+        
+        if not results:
+            return JSONResponse(
+                status_code=404,
+                content={"success": False, "message": f"Text '{query}' not found in document"}
+            )
+        
+        return {
+            "success": True,
+            "total_matches": len(results),
+            "matches": results,
+            "usage_note": "Use the full_row coordinates with /get-snippet-image endpoint to generate row images"
+        }
+        
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "error": str(e)}
+        )
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -8,8 +8,347 @@ from typing import List, Dict, Optional
 import json
 from PIL import Image, ImageEnhance, ImageFilter
 import numpy as np
+from difflib import SequenceMatcher
 
 app = FastAPI()
+
+def detect_invoice_table_structure(page):
+    """
+    Detect invoice table structure using the first data row as the main key.
+    Returns header information and all row coordinates.
+    """
+    text_dict = page.get_text("dict")
+    
+    # Collect all text blocks with positions
+    text_blocks = []
+    for block in text_dict["blocks"]:
+        if "lines" in block:
+            for line in block["lines"]:
+                for span in line["spans"]:
+                    if span["text"].strip():
+                        text_blocks.append({
+                            "text": span["text"].strip(),
+                            "bbox": span["bbox"],
+                            "x": span["bbox"][0],
+                            "y": span["bbox"][1],
+                            "font_size": span["size"],
+                            "font_name": span["font"]
+                        })
+    
+    # Sort by Y position (top to bottom), then X position (left to right)
+    text_blocks.sort(key=lambda x: (x["y"], x["x"]))
+    
+    # Find table header keywords
+    header_keywords = [
+        "SR NO", "S NO", "DESCRIPTION", "PARTICULARS", "QTY", "QUANTITY", 
+        "UNIT", "PRICE", "AMOUNT", "HS CODE", "PKG", "REF", "GROSS WEIGHT",
+        "FULL DESCRIPTION", "GOODS"
+    ]
+    
+    header_blocks = []
+    header_y_position = None
+    
+    # Identify header row
+    for block in text_blocks:
+        text_upper = block["text"].upper()
+        if any(keyword in text_upper for keyword in header_keywords):
+            if header_y_position is None:
+                header_y_position = block["y"]
+            # Group blocks that are on the same horizontal line (within 10 pixels)
+            if abs(block["y"] - header_y_position) <= 10:
+                header_blocks.append(block)
+    
+    if not header_blocks:
+        return {"error": "No table header found", "header_blocks": [], "table_rows": []}
+    
+    # Sort header blocks by X position
+    header_blocks.sort(key=lambda x: x["x"])
+    
+    # Create column boundaries based on header positions
+    column_boundaries = []
+    for i, header in enumerate(header_blocks):
+        start_x = header["x"]
+        end_x = header_blocks[i + 1]["x"] if i + 1 < len(header_blocks) else page.rect.width
+        column_boundaries.append({
+            "column_name": header["text"],
+            "start_x": start_x,
+            "end_x": end_x,
+            "header_bbox": header["bbox"]
+        })
+    
+    # Find data rows (everything below header)
+    data_start_y = header_y_position + 20  # Start looking for data 20 pixels below header
+    data_blocks = [block for block in text_blocks if block["y"] > data_start_y]
+    
+    # Group data blocks into rows
+    rows = []
+    current_row = []
+    current_y = None
+    
+    for block in data_blocks:
+        # Skip if text looks like footer or non-data content
+        text_upper = block["text"].upper()
+        if any(skip_word in text_upper for skip_word in ["TOTAL", "CONTAINER", "PORT OF", "COUNTRY", "NET WEIGHT", 
+                                                        "GROSS WEIGHT", "BANK ACCOUNT", "CURRENCY", "VAT", "AED", "USD",
+                                                        "TERMS OF SALE", "DOT 20", "PFI", "SOFTWARE", "PAGE"]):
+            continue
+            
+        # Group blocks by Y position (same row)
+        if current_y is None or abs(block["y"] - current_y) <= 8:
+            current_row.append(block)
+            current_y = block["y"] if current_y is None else current_y
+        else:
+            # Process completed row
+            if current_row and len(current_row) >= 2:  # At least 2 columns to be considered a valid row
+                rows.append(process_invoice_row(current_row, column_boundaries))
+            current_row = [block]
+            current_y = block["y"]
+    
+    # Process last row
+    if current_row and len(current_row) >= 2:
+        rows.append(process_invoice_row(current_row, column_boundaries))
+    
+    # Filter valid rows
+    valid_rows = [row for row in rows if row and row.get("is_valid_data_row")]
+    
+    return {
+        "header_info": {
+            "columns": [{"name": col["column_name"], "x_range": [col["start_x"], col["end_x"]]} for col in column_boundaries],
+            "header_y_position": header_y_position,
+            "total_columns": len(column_boundaries)
+        },
+        "table_rows": valid_rows,
+        "total_data_rows": len(valid_rows)
+    }
+
+def process_invoice_row(row_blocks, column_boundaries):
+    """
+    Process a single invoice row and map text to appropriate columns.
+    """
+    row_blocks.sort(key=lambda x: x["x"])
+    
+    # Calculate full row bounding box
+    min_x = min(block["bbox"][0] for block in row_blocks)
+    min_y = min(block["bbox"][1] for block in row_blocks)
+    max_x = max(block["bbox"][2] for block in row_blocks)
+    max_y = max(block["bbox"][3] for block in row_blocks)
+    
+    full_row_bbox = [min_x, min_y, max_x, max_y]
+    
+    # Map text to columns
+    row_data = {}
+    for block in row_blocks:
+        block_x = block["x"]
+        # Find which column this text belongs to
+        for col in column_boundaries:
+            if col["start_x"] <= block_x < col["end_x"]:
+                col_name = col["column_name"].lower().replace(" ", "_")
+                if col_name not in row_data:
+                    row_data[col_name] = []
+                row_data[col_name].append(block["text"])
+                break
+    
+    # Combine text for each column
+    for col_name in row_data:
+        row_data[col_name] = " ".join(row_data[col_name])
+    
+    # Check if this is a valid data row (has meaningful content)
+    is_valid = False
+    if row_data:
+        # Check for typical invoice row indicators
+        text_content = " ".join(row_data.values()).upper()
+        
+        # Check if row starts with a product/reference code (like 581511, 532421)
+        first_text = row_blocks[0]["text"] if row_blocks else ""
+        has_product_code = bool(re.match(r'^\d{6}', first_text))  # 6-digit product codes
+        
+        # Must have some substantial content and not be just numbers/codes
+        if len(text_content) > 10 and any(indicator in text_content for indicator in 
+                                        ["OIL", "MOTOR", "DIESEL", "GEAR", "HYDRAULIC", "TYRE", "EAGLE", "CASTLE", 
+                                         "GOODYEAR", "EAG", "ASY", "XL", "FP"]):
+            is_valid = True
+        # Or if it has serial number + description pattern
+        elif any(key for key in row_data.keys() if "sr" in key.lower() or "no" in key.lower() or "ref" in key.lower()):
+            if len(text_content) > 15:
+                is_valid = True
+        # Or if it starts with a product code and has sufficient content
+        elif has_product_code and len(text_content) > 20:
+            is_valid = True
+    
+    return {
+        "row_data": row_data,
+        "full_row_bbox": full_row_bbox,
+        "row_coordinates": {
+            "x0": min_x,
+            "y0": min_y, 
+            "x1": max_x,
+            "y1": max_y
+        },
+        "is_valid_data_row": is_valid,
+        "text_blocks_count": len(row_blocks)
+    }
+
+
+def extract_text_with_multiple_methods(page):
+    """
+    Extract text using multiple methods to handle scanned documents better.
+    """
+    all_text_blocks = []
+    
+    # Method 1: Standard text extraction with words
+    try:
+        words = page.get_text("words")
+        for word in words:
+            if len(word) >= 5 and word[4].strip():  # word[4] is text
+                all_text_blocks.append({
+                    "text": word[4].strip(),
+                    "bbox": [word[0], word[1], word[2], word[3]],
+                    "method": "words"
+                })
+    except:
+        pass
+    
+    # Method 2: Dictionary-based extraction
+    try:
+        text_dict = page.get_text("dict")
+        for block in text_dict["blocks"]:
+            if "lines" in block:
+                for line in block["lines"]:
+                    line_text = ""
+                    line_bbox = None
+                    for span in line["spans"]:
+                        if span["text"].strip():
+                            line_text += span["text"] + " "
+                            if line_bbox is None:
+                                line_bbox = list(span["bbox"])
+                            else:
+                                # Expand bbox to include this span
+                                line_bbox[0] = min(line_bbox[0], span["bbox"][0])
+                                line_bbox[1] = min(line_bbox[1], span["bbox"][1])
+                                line_bbox[2] = max(line_bbox[2], span["bbox"][2])
+                                line_bbox[3] = max(line_bbox[3], span["bbox"][3])
+                    
+                    if line_text.strip() and line_bbox:
+                        all_text_blocks.append({
+                            "text": line_text.strip(),
+                            "bbox": line_bbox,
+                            "method": "dict"
+                        })
+    except:
+        pass
+    
+    # Method 3: Block-based extraction
+    try:
+        blocks = page.get_text("blocks")
+        for block in blocks:
+            if len(block) >= 5 and block[4].strip():  # block[4] is text
+                all_text_blocks.append({
+                    "text": block[4].strip(),
+                    "bbox": [block[0], block[1], block[2], block[3]],
+                    "method": "blocks"
+                })
+    except:
+        pass
+    
+    return all_text_blocks
+
+def enhanced_search_multiline_text(page, query, max_line_gap=100, fuzzy_threshold=0.7):
+    """
+    Enhanced multiline text search with fuzzy matching for scanned documents.
+    """
+    # Get all text blocks using multiple methods
+    all_text_blocks = extract_text_with_multiple_methods(page)
+    
+    if not all_text_blocks:
+        return []
+    
+    # Sort by vertical position, then horizontal
+    all_text_blocks.sort(key=lambda x: (x["bbox"][1], x["bbox"][0]))
+    
+    # Normalize query
+    normalized_query = normalize_text(query)
+    query_words = normalized_query.split()
+    
+    if not query_words:
+        return []
+    
+    matches = []
+    
+    # Method 1: Exact phrase search in individual blocks
+    for block in all_text_blocks:
+        block_text = normalize_text(block["text"])
+        if normalized_query in block_text:
+            matches.append(block["bbox"])
+    
+    # Method 2: Fuzzy matching for individual blocks
+    for block in all_text_blocks:
+        score = fuzzy_match_score(block["text"], query)
+        if score >= fuzzy_threshold:
+            matches.append(block["bbox"])
+    
+    # Method 3: Word-by-word fuzzy search across blocks
+    for i in range(len(all_text_blocks)):
+        current_blocks = [all_text_blocks[i]]
+        current_text = normalize_text(all_text_blocks[i]["text"])
+        current_words = current_text.split()
+        
+        # Try to match query words starting from this block
+        matched_words = 0
+        j = i + 1
+        
+        while matched_words < len(query_words) and j < len(all_text_blocks):
+            # Check if next block is close enough (same line or nearby)
+            y_diff = abs(all_text_blocks[j]["bbox"][1] - all_text_blocks[i]["bbox"][1])
+            if y_diff > max_line_gap:
+                break
+            
+            current_blocks.append(all_text_blocks[j])
+            next_text = normalize_text(all_text_blocks[j]["text"])
+            current_words.extend(next_text.split())
+            j += 1
+        
+        # Check if current combination of blocks contains query
+        combined_text = " ".join(current_words)
+        if fuzzy_match_score(combined_text, normalized_query) >= fuzzy_threshold:
+            # Calculate combined bounding box
+            min_x = min(block["bbox"][0] for block in current_blocks)
+            min_y = min(block["bbox"][1] for block in current_blocks)
+            max_x = max(block["bbox"][2] for block in current_blocks)
+            max_y = max(block["bbox"][3] for block in current_blocks)
+            matches.append([min_x, min_y, max_x, max_y])
+    
+    # Method 4: Partial word matching for very unclear scans
+    if not matches and len(query_words) == 1:
+        single_word = query_words[0]
+        for block in all_text_blocks:
+            block_words = normalize_text(block["text"]).split()
+            for word in block_words:
+                if (len(word) >= 3 and len(single_word) >= 3 and 
+                    fuzzy_match_score(word, single_word) >= 0.8):
+                    matches.append(block["bbox"])
+                    break
+    
+    # Remove duplicate matches (same area)
+    unique_matches = []
+    for match in matches:
+        is_duplicate = False
+        for existing in unique_matches:
+            # Check if bounding boxes overlap significantly
+            overlap_x = max(0, min(match[2], existing[2]) - max(match[0], existing[0]))
+            overlap_y = max(0, min(match[3], existing[3]) - max(match[1], existing[1]))
+            overlap_area = overlap_x * overlap_y
+            
+            match_area = (match[2] - match[0]) * (match[3] - match[1])
+            existing_area = (existing[2] - existing[0]) * (existing[3] - existing[1])
+            
+            if overlap_area > 0.5 * min(match_area, existing_area):
+                is_duplicate = True
+                break
+        
+        if not is_duplicate:
+            unique_matches.append(match)
+    
+    return unique_matches
 
 def extract_table_data(page):
 
@@ -365,117 +704,441 @@ async def get_snippet_image(
         )
 
 # UTILITY ENDPOINTS
+import re
+import fitz
+from difflib import SequenceMatcher
+
+def normalize_text(text):
+    """
+    Enhanced text normalization for scanned documents with OCR errors.
+    """
+    if not text:
+        return ""
+    
+    # Convert to uppercase for case-insensitive matching
+    text = text.upper()
+    
+    # Common OCR error corrections
+    ocr_corrections = {
+        # Common character misreadings
+        '0': 'O',  # Zero to O
+        'O': '0',  # O to zero (bidirectional)
+        '1': 'I',  # One to I
+        'I': '1',  # I to one
+        '5': 'S',  # Five to S
+        'S': '5',  # S to five
+        '6': 'G',  # Six to G
+        'G': '6',  # G to six
+        '8': 'B',  # Eight to B
+        'B': '8',  # B to eight
+        'Z': '2',  # Z to 2
+        '2': 'Z',  # 2 to Z
+        # Common punctuation issues
+        '.': '',   # Remove dots that might be noise
+        ',': '',   # Remove commas
+        ';': '',   # Remove semicolons
+        ':': '',   # Remove colons
+        # Remove extra spaces
+        '  ': ' ',
+        '   ': ' ',
+    }
+    
+    # Apply corrections
+    corrected_text = text
+    for wrong, correct in ocr_corrections.items():
+        corrected_text = corrected_text.replace(wrong, correct)
+    
+    # Remove multiple spaces and strip
+    corrected_text = re.sub(r'\s+', ' ', corrected_text).strip()
+    
+    return corrected_text
+
+def fuzzy_match_score(text1, text2, threshold=0.6):
+    """
+    Calculate fuzzy matching score between two text strings.
+    Returns score between 0 and 1, where 1 is perfect match.
+    """
+    if not text1 or not text2:
+        return 0.0
+    
+    # Normalize both texts
+    norm_text1 = normalize_text(text1)
+    norm_text2 = normalize_text(text2)
+    
+    # Direct match first
+    if norm_text1 == norm_text2:
+        return 1.0
+    
+    # Fuzzy matching using SequenceMatcher
+    similarity = SequenceMatcher(None, norm_text1, norm_text2).ratio()
+    
+    # Also check if one text contains the other (partial match)
+    if norm_text1 in norm_text2 or norm_text2 in norm_text1:
+        similarity = max(similarity, 0.8)
+    
+    return similarity
+
+def extract_text_with_multiple_methods(page):
+    """
+    Extract text using multiple methods to handle scanned documents better.
+    """
+    all_text_blocks = []
+    
+    # Method 1: Standard text extraction with words
+    try:
+        words = page.get_text("words")
+        for word in words:
+            if len(word) >= 5 and word[4].strip():  # word[4] is text
+                all_text_blocks.append({
+                    "text": word[4].strip(),
+                    "bbox": [word[0], word[1], word[2], word[3]],
+                    "method": "words"
+                })
+    except:
+        pass
+    
+    # Method 2: Dictionary-based extraction
+    try:
+        text_dict = page.get_text("dict")
+        for block in text_dict["blocks"]:
+            if "lines" in block:
+                for line in block["lines"]:
+                    line_text = ""
+                    line_bbox = None
+                    for span in line["spans"]:
+                        if span["text"].strip():
+                            line_text += span["text"] + " "
+                            if line_bbox is None:
+                                line_bbox = list(span["bbox"])
+                            else:
+                                # Expand bbox to include this span
+                                line_bbox[0] = min(line_bbox[0], span["bbox"][0])
+                                line_bbox[1] = min(line_bbox[1], span["bbox"][1])
+                                line_bbox[2] = max(line_bbox[2], span["bbox"][2])
+                                line_bbox[3] = max(line_bbox[3], span["bbox"][3])
+                    
+                    if line_text.strip() and line_bbox:
+                        all_text_blocks.append({
+                            "text": line_text.strip(),
+                            "bbox": line_bbox,
+                            "method": "dict"
+                        })
+    except:
+        pass
+    
+    # Method 3: Block-based extraction
+    try:
+        blocks = page.get_text("blocks")
+        for block in blocks:
+            if len(block) >= 5 and block[4].strip():  # block[4] is text
+                all_text_blocks.append({
+                    "text": block[4].strip(),
+                    "bbox": [block[0], block[1], block[2], block[3]],
+                    "method": "blocks"
+                })
+    except:
+        pass
+    
+    return all_text_blocks
+
+def enhanced_search_multiline_text(page, query, max_line_gap=100, fuzzy_threshold=0.7):
+    """
+    Enhanced multiline text search with fuzzy matching for scanned documents.
+    """
+    # Get all text blocks using multiple methods
+    all_text_blocks = extract_text_with_multiple_methods(page)
+    
+    if not all_text_blocks:
+        return []
+    
+    # Sort by vertical position, then horizontal
+    all_text_blocks.sort(key=lambda x: (x["bbox"][1], x["bbox"][0]))
+    
+    # Normalize query
+    normalized_query = normalize_text(query)
+    query_words = normalized_query.split()
+    
+    if not query_words:
+        return []
+    
+    matches = []
+    
+    # Method 1: Exact phrase search in individual blocks
+    for block in all_text_blocks:
+        block_text = normalize_text(block["text"])
+        if normalized_query in block_text:
+            matches.append(block["bbox"])
+    
+    # Method 2: Fuzzy matching for individual blocks
+    for block in all_text_blocks:
+        score = fuzzy_match_score(block["text"], query)
+        if score >= fuzzy_threshold:
+            matches.append(block["bbox"])
+    
+    # Method 3: Word-by-word fuzzy search across blocks
+    for i in range(len(all_text_blocks)):
+        current_blocks = [all_text_blocks[i]]
+        current_text = normalize_text(all_text_blocks[i]["text"])
+        current_words = current_text.split()
+        
+        # Try to match query words starting from this block
+        matched_words = 0
+        j = i + 1
+        
+        while matched_words < len(query_words) and j < len(all_text_blocks):
+            # Check if next block is close enough (same line or nearby)
+            y_diff = abs(all_text_blocks[j]["bbox"][1] - all_text_blocks[i]["bbox"][1])
+            if y_diff > max_line_gap:
+                break
+            
+            current_blocks.append(all_text_blocks[j])
+            next_text = normalize_text(all_text_blocks[j]["text"])
+            current_words.extend(next_text.split())
+            j += 1
+        
+        # Check if current combination of blocks contains query
+        combined_text = " ".join(current_words)
+        if fuzzy_match_score(combined_text, normalized_query) >= fuzzy_threshold:
+            # Calculate combined bounding box
+            min_x = min(block["bbox"][0] for block in current_blocks)
+            min_y = min(block["bbox"][1] for block in current_blocks)
+            max_x = max(block["bbox"][2] for block in current_blocks)
+            max_y = max(block["bbox"][3] for block in current_blocks)
+            matches.append([min_x, min_y, max_x, max_y])
+    
+    # Method 4: Partial word matching for very unclear scans
+    if not matches and len(query_words) == 1:
+        single_word = query_words[0]
+        for block in all_text_blocks:
+            block_words = normalize_text(block["text"]).split()
+            for word in block_words:
+                if (len(word) >= 3 and len(single_word) >= 3 and 
+                    fuzzy_match_score(word, single_word) >= 0.8):
+                    matches.append(block["bbox"])
+                    break
+    
+    # Remove duplicate matches (same area)
+    unique_matches = []
+    for match in matches:
+        is_duplicate = False
+        for existing in unique_matches:
+            # Check if bounding boxes overlap significantly
+            overlap_x = max(0, min(match[2], existing[2]) - max(match[0], existing[0]))
+            overlap_y = max(0, min(match[3], existing[3]) - max(match[1], existing[1]))
+            overlap_area = overlap_x * overlap_y
+            
+            match_area = (match[2] - match[0]) * (match[3] - match[1])
+            existing_area = (existing[2] - existing[0]) * (existing[3] - existing[1])
+            
+            if overlap_area > 0.5 * min(match_area, existing_area):
+                is_duplicate = True
+                break
+        
+        if not is_duplicate:
+            unique_matches.append(match)
+    
+    return unique_matches
 
 @app.post("/search-text")
 async def search_text(
     file: UploadFile,
     query: str = Form(...),
-    search_type: str = Form("expanded"),  # "normal", "expanded"
-    padding: float = Form(30.0)
+    search_type: str = Form("enhanced"),  # "normal", "expanded", "enhanced"
+    fuzzy_threshold: float = Form(0.7),   # Fuzzy matching threshold (0.0 - 1.0)
+    pad_top: float = Form(20.0),
+    pad_bottom: float = Form(20.0),
+    pad_left: float = Form(20.0),
+    pad_right: float = Form(20.0)
 ):
     """
-    Universal text search endpoint combining normal and expanded search functionality.
-    
-    Args:
-        search_type: "normal" returns all matches, "expanded" returns best match with padding
+    Enhanced search text with fuzzy matching for scanned documents.
+    - 'normal': Standard search (all matches)
+    - 'expanded': Best match only  
+    - 'enhanced': Fuzzy matching with OCR error handling (recommended for scanned docs)
+    """
+    try:
+        if not query.strip():
+            return JSONResponse(status_code=400, content={"error": "Empty query is not allowed."})
+        
+        if not 0.0 <= fuzzy_threshold <= 1.0:
+            return JSONResponse(status_code=400, content={"error": "Fuzzy threshold must be between 0.0 and 1.0."})
+            
+        if any(p < 0 or p > 200 for p in [pad_top, pad_bottom, pad_left, pad_right]):
+            return JSONResponse(status_code=400, content={"error": "Padding must be between 0 and 200 pixels."})
+
+        pdf_bytes = await file.read()
+        stream = io.BytesIO(pdf_bytes)
+        doc = fitz.open(stream=stream, filetype="pdf")
+
+        matches = []
+
+        for i, page in enumerate(doc):
+            width, height = page.rect.width, page.rect.height
+            page_number = i + 1
+
+            if search_type == "enhanced":
+                # Use enhanced search with fuzzy matching
+                enhanced_matches = enhanced_search_multiline_text(page, query, fuzzy_threshold=fuzzy_threshold)
+                for r in enhanced_matches:
+                    matches.append({
+                        "page": page_number,
+                        "x0": max(r[0] - pad_left, 0),
+                        "y0": max(r[1] - pad_top, 0),
+                        "x1": min(r[2] + pad_right, width),
+                        "y1": min(r[3] + pad_bottom, height),
+                        "type": "enhanced_fuzzy",
+                        "confidence": "high" if len(enhanced_matches) == 1 else "medium"
+                    })
+                    
+            elif search_type == "normal":
+                # Original normal search
+                single_matches = page.search_for(query)
+                for r in single_matches:
+                    matches.append({
+                        "page": page_number,
+                        "x0": max(r.x0 - pad_left, 0),
+                        "y0": max(r.y0 - pad_top, 0),
+                        "x1": min(r.x1 + pad_right, width),
+                        "y1": min(r.y1 + pad_bottom, height),
+                        "type": "exact_match"
+                    })
+
+                # Also try enhanced search as fallback
+                if not single_matches:
+                    enhanced_matches = enhanced_search_multiline_text(page, query, fuzzy_threshold=fuzzy_threshold)
+                    for r in enhanced_matches:
+                        matches.append({
+                            "page": page_number,
+                            "x0": max(r[0] - pad_left, 0),
+                            "y0": max(r[1] - pad_top, 0),
+                            "x1": min(r[2] + pad_right, width),
+                            "y1": min(r[3] + pad_bottom, height),
+                            "type": "fuzzy_fallback"
+                        })
+
+            else:  # expanded mode
+                best_match = None
+                best_score = 0
+                best_rect = None
+                best_type = None
+
+                # Try exact search first
+                single_matches = page.search_for(query)
+                if single_matches:
+                    r = single_matches[0]  # Take first exact match
+                    best_rect = [
+                        max(r.x0 - pad_left, 0),
+                        max(r.y0 - pad_top, 0),
+                        min(r.x1 + pad_right, width),
+                        min(r.y1 + pad_bottom, height)
+                    ]
+                    best_type = "exact_match"
+                    best_score = 1.0
+                else:
+                    # Use enhanced search
+                    enhanced_matches = enhanced_search_multiline_text(page, query, fuzzy_threshold=fuzzy_threshold)
+                    if enhanced_matches:
+                        r = enhanced_matches[0]  # Take first enhanced match
+                        best_rect = [
+                            max(r[0] - pad_left, 0),
+                            max(r[1] - pad_top, 0),
+                            min(r[2] + pad_right, width),
+                            min(r[3] + pad_bottom, height)
+                        ]
+                        best_type = "enhanced_match"
+                        best_score = fuzzy_threshold
+
+                if best_rect:
+                    matches.append({
+                        "page": page_number,
+                        "x0": best_rect[0],
+                        "y0": best_rect[1],
+                        "x1": best_rect[2],
+                        "y1": best_rect[3],
+                        "type": best_type,
+                        "confidence_score": best_score
+                    })
+
+        if not matches:
+            return JSONResponse(
+                status_code=404, 
+                content={
+                    "success": False, 
+                    "message": f"No matches found for '{query}'. Try reducing fuzzy_threshold or using 'enhanced' search_type.",
+                    "suggestion": "For scanned documents, try fuzzy_threshold=0.5 or lower"
+                }
+            )
+
+        return {
+            "success": True,
+            "query": query,
+            "search_type": search_type,
+            "fuzzy_threshold": fuzzy_threshold if search_type == "enhanced" else None,
+            "padding": {
+                "top": pad_top,
+                "bottom": pad_bottom,
+                "left": pad_left,
+                "right": pad_right
+            },
+            "matches": matches,
+            "total_matches": len(matches)
+        }
+
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "error": f"Internal error: {str(e)}"})
+
+# Also add this diagnostic endpoint
+@app.post("/diagnose-text-extraction")
+async def diagnose_text_extraction(
+    file: UploadFile,
+    page: int = Form(1)
+):
+    """
+    Diagnostic endpoint to see what text is being extracted from a page.
+    Useful for debugging scanned documents.
     """
     try:
         pdf_bytes = await file.read()
         stream = io.BytesIO(pdf_bytes)
         doc = fitz.open(stream=stream, filetype="pdf")
         
-        if search_type == "normal":
-            # Return all matches
-            matches = []
-            for i, page in enumerate(doc):
-                # Regular search
-                rects = page.search_for(query)
-                for r in rects:
-                    matches.append({
-                        "page": i + 1,
-                        "x0": r.x0,
-                        "y0": r.y0,
-                        "x1": r.x1,
-                        "y1": r.y1,
-                        "type": "single_line"
-                    })
-                
-                # Multi-line search
-                multiline_rects = search_multiline_text(page, query)
-                for r in multiline_rects:
-                    matches.append({
-                        "page": i + 1,
-                        "x0": r[0],
-                        "y0": r[1],
-                        "x1": r[2],
-                        "y1": r[3],
-                        "type": "multi_line"
-                    })
-            
-            return {"success": True, "matches": matches}
+        if page < 1 or page > len(doc):
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"Invalid page number. PDF has {len(doc)} pages."}
+            )
         
-        else:  # expanded search
-            # Return best match with padding
-            best_match = None
-            best_match_type = None
-            best_match_rect = None
-            best_match_score = 0
-            best_match_page = None
-
-            query_words = [word.upper() for word in query.split() if word.strip()]
-            if not query_words:
-                return {"error": "Empty or invalid query"}
-
-            for i, page in enumerate(doc):
-                width, height = page.rect.width, page.rect.height
-
-                # Single-line match check
-                rects = page.search_for(query)
-                for r in rects:
-                    match_score = len(query)
-                    if match_score > best_match_score:
-                        best_match_score = match_score
-                        best_match_type = "single_line"
-                        best_match_rect = [
-                            max(r.x0 - padding, 0),
-                            max(r.y0 - padding, 0),
-                            min(r.x1 + padding, width),
-                            min(r.y1 + padding, height)
-                        ]
-                        best_match_page = i + 1
-
-                # Multi-line match check
-                multiline_rects = search_multiline_text(page, query)
-                for r in multiline_rects:
-                    rect_text = page.get_textbox(fitz.Rect(*r))
-                    match_words = [word.upper() for word in rect_text.split() if word.strip()]
-                    for start_idx in range(len(match_words) - len(query_words) + 1):
-                        if match_words[start_idx:start_idx + len(query_words)] == query_words:
-                            match_score = len(query_words)
-                            if match_score > best_match_score:
-                                best_match_score = match_score
-                                best_match_type = "multi_line"
-                                best_match_rect = [
-                                    max(r[0] - padding, 0),
-                                    max(r[1] - padding, 0),
-                                    min(r[2] + padding, width),
-                                    min(r[3] + padding, height)
-                                ]
-                                best_match_page = i + 1
-                            break
-
-            if best_match_rect:
-                return {
-                    "success": True,
-                    "page": best_match_page,
-                    "x0": best_match_rect[0],
-                    "y0": best_match_rect[1],
-                    "x1": best_match_rect[2],
-                    "y1": best_match_rect[3],
-                    "type": best_match_type
-                }
-            else:
-                return {"success": False, "message": "No match found"}
+        selected_page = doc[page - 1]
+        
+        # Extract using all methods
+        all_text_blocks = extract_text_with_multiple_methods(selected_page)
+        
+        # Organize by extraction method
+        results = {
+            "page": page,
+            "total_blocks_found": len(all_text_blocks),
+            "extraction_methods": {}
+        }
+        
+        for method in ["words", "dict", "blocks"]:
+            method_blocks = [block for block in all_text_blocks if block["method"] == method]
+            results["extraction_methods"][method] = {
+                "count": len(method_blocks),
+                "sample_texts": [block["text"][:100] + "..." if len(block["text"]) > 100 else block["text"] 
+                               for block in method_blocks[:5]]  # First 5 samples
+            }
+        
+        # Show raw text extraction
+        try:
+            raw_text = selected_page.get_text()
+            results["raw_text_sample"] = raw_text[:500] + "..." if len(raw_text) > 500 else raw_text
+        except:
+            results["raw_text_sample"] = "Failed to extract raw text"
+        
+        doc.close()
+        return results
         
     except Exception as e:
         return JSONResponse(
@@ -665,6 +1328,56 @@ async def get_quality_settings():
         ]
     }
 
+@app.post("/detect-invoice-table")
+async def detect_invoice_table(file: UploadFile, page_number: int = Form(1)):
+    """
+    Detect invoice table structure using the first row as main key.
+    Returns header information and complete row coordinates for all data rows.
+    """
+    try:
+        pdf_bytes = await file.read()
+        stream = io.BytesIO(pdf_bytes)
+        doc = fitz.open(stream=stream, filetype="pdf")
+        
+        if page_number < 1 or page_number > len(doc):
+            return JSONResponse(
+                status_code=400,
+                content={"error": f"Invalid page number. PDF has {len(doc)} pages."}
+            )
+        
+        page = doc[page_number - 1]
+        
+        # Detect table structure
+        table_structure = detect_invoice_table_structure(page)
+        
+        doc.close()
+        
+        if "error" in table_structure:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "success": False,
+                    "error": table_structure["error"],
+                    "page": page_number
+                }
+            )
+        
+        return {
+            "success": True,
+            "page": page_number,
+            "header_info": table_structure["header_info"],
+            "total_data_rows": table_structure["total_data_rows"],
+            "table_rows": table_structure["table_rows"],
+            "usage_note": "Use row_coordinates with /get-snippet-image endpoint to generate row images"
+        }
+        
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "error": str(e)}
+        )
+    
+    
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

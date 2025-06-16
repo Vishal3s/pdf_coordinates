@@ -10,3 +10,5 @@ scikit-image
 pytest
 pytest-asyncio
 httpx
+pdf2image
+pytesseract

@@ -7,8 +7,10 @@ import io
 import base64
 import fitz
 import pytesseract
+import os
+pytesseract.pytesseract.tesseract_cmd = os.getenv("TESSERACT_CMD", r"C:\Program Files\Tesseract-OCR\tesseract.exe")
 
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
 
 app = FastAPI()
 
@@ -115,12 +117,7 @@ async def get_row_by_query(
 
 @app.post("/detect-coordinates-in-image")
 async def detect_coordinates_in_image(file: UploadFile, query: str = Form(...), padding: int = Form(10)):
-    import pytesseract
-    from PIL import Image
-    import io
-
-    # Set Tesseract path if needed
-    pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    
 
     try:
         contents = await file.read()

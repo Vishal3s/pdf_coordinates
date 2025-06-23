@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, Form
+from fastapi import FastAPI, UploadFile, Form ,File
 from fastapi.responses import StreamingResponse, JSONResponse
 import fitz  # PyMuPDF
 import io
@@ -941,6 +941,20 @@ def is_scanned_page(page) -> bool:
     text = page.get_text().strip()
     return len(text) < 50  # Very little text indicates scanned page
 
+def estimate_images_page_quality(page) -> Dict:
+    """
+    Calculates exact DPI for both text-based and image-based pages.
+    """
+    dpi_info = calculate_exact_dpi(page)
+    text = page.get_text().strip()
+    page_type = "image-based" if len(text) < 50 else "text-based"
+
+    return {
+        "page_type": page_type,
+        "dpi_estimate": dpi_info.get("average_dpi"),
+        "dpi_details": dpi_info
+    }
+
 def estimate_page_quality(page) -> Dict:
     """
     Returns quality information for a single PDF page with accurate DPI estimation.
@@ -962,6 +976,8 @@ def estimate_page_quality(page) -> Dict:
                 "average_dpi": 250
             }
         }
+
+
 
 @app.post("/pdf-dpi-check")
 async def check_pdf_dpi(file: UploadFile):
@@ -1237,6 +1253,38 @@ async def get_row_by_query(
             status_code=500,
             content={"success": False, "error": str(e)}
         )
+    
+@app.post("/image-dpi")
+async def calculate_image_dpi(file: UploadFile = File(...)):
+    """
+    Calculate DPI of an image assuming it's a scanned A4 document.
+    No DPI metadata required.
+    """
+    try:
+        contents = await file.read()
+        img = Image.open(io.BytesIO(contents))
+        width_px, height_px = img.size
+
+        # Assumed A4 size in inches
+        a4_width_in = 8.27
+        a4_height_in = 11.69
+
+        dpi_x = width_px / a4_width_in
+        dpi_y = height_px / a4_height_in
+        avg_dpi = round((dpi_x + dpi_y) / 2, 1)
+
+        return {
+            "dpi_x": round(dpi_x, 1),
+            "dpi_y": round(dpi_y, 1),
+            "average_dpi": avg_dpi,
+            "pixel_dimensions": {"width": width_px, "height": height_px},
+            "assumed_physical_size": "A4 (8.27 x 11.69 inches)",
+            "note": "DPI calculated from image pixels assuming A4 size"
+        }
+
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
 
 if __name__ == "__main__":
     import uvicorn

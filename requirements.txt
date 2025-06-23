@@ -4,8 +4,6 @@ python-multipart
 PyMuPDF
 Pillow
 numpy
-python-magic
-python-magic-bin
 pydantic
 starlette
 aiofiles
